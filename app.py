@@ -1,6 +1,15 @@
 """가족 가전 교체 알리미 — Streamlit Community Cloud 배포용
 
-[배포 방법]
+[바로 실행 — Supabase 설정 불필요]
+GitHub의 app.py를 이 파일로 교체하면 됩니다. requirements.txt도 함께 올리세요.
+Secrets가 없으면 SQLite 간편 모드로 시작하며 첫 접속에서 가족 암호를 만듭니다.
+공개 주소를 공유하기 전에 본인이 먼저 암호를 설정하세요.
+간편 모드 데이터/암호는 앱 서버 파일에 저장됩니다. Cloud 재배포·서버 교체 시
+사라질 수 있습니다. 영구 보관을 원할 때만 아래 Supabase 선택 설정을 사용하세요.
+Secrets FAMILY_PASSWORD로 암호를 고정할 수도 있습니다.
+간편 모드와 Supabase 모드 사이의 기존 데이터는 자동 이전되지 않습니다.
+
+[선택: 영구 저장용 Supabase 배포 방법]
 1. GitHub 저장소에 app.py, requirements.txt 두 파일을 올립니다.
 2. Supabase 프로젝트를 만든 뒤 SQL Editor에서 아래 SQL을 실행합니다.
    (한 프로젝트에서 여러 가족을 쓸 경우 가족마다 FAMILY_ID와 암호를 다르게 설정합니다.)
@@ -51,6 +60,10 @@ APP_URL = "https://YOUR_APP.streamlit.app"
 from __future__ import annotations
 
 import hmac
+import hashlib
+import secrets
+import sqlite3
+from pathlib import Path
 import io
 import uuid
 from datetime import date, datetime
@@ -87,9 +100,70 @@ URL = config("SUPABASE_URL").rstrip("/")
 KEY = config("SUPABASE_SERVICE_ROLE_KEY")
 FAMILY = config("FAMILY_ID")
 PASSWORD = config("FAMILY_PASSWORD")
+CLOUD = all([URL, KEY, FAMILY])
+if not CLOUD:
+    FAMILY = "local-family"
+DB_PATH = Path(__file__).resolve().parent / "family_appliances.sqlite3"
+
+
+def connection():
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def initialize_local():
+    with connection() as con:
+        con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        con.execute("""CREATE TABLE IF NOT EXISTS appliance_items (
+            id TEXT PRIMARY KEY, family_id TEXT NOT NULL, kind TEXT NOT NULL,
+            name TEXT NOT NULL, price INTEGER NOT NULL,
+            purchased_on TEXT NOT NULL, replacement_on TEXT NOT NULL)""")
+
+
+def saved_password():
+    with connection() as con:
+        row = con.execute("SELECT value FROM settings WHERE key='password'").fetchone()
+    return row[0] if row else ""
+
+
+def create_password(password):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 600000).hex()
+    with connection() as con:
+        cursor = con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('password',?)", (salt + ":" + digest,))
+        return cursor.rowcount == 1
+
+
+def valid_password(password):
+    if PASSWORD:
+        return hmac.compare_digest(password.encode(), PASSWORD.encode())
+    stored = saved_password()
+    if not stored:
+        return False
+    salt, digest = stored.split(":", 1)
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 600000).hex()
+    return hmac.compare_digest(actual, digest)
+
 
 
 def api(method: str, *, body=None, item_id=None):
+    if not CLOUD:
+        try:
+            with connection() as con:
+                if method == "GET":
+                    return [dict(r) for r in con.execute(
+                        "SELECT * FROM appliance_items WHERE family_id=? ORDER BY replacement_on", (FAMILY,))]
+                if method == "POST":
+                    fields = ("id", "family_id", "kind", "name", "price", "purchased_on", "replacement_on")
+                    con.execute("INSERT INTO appliance_items VALUES (?,?,?,?,?,?,?)", tuple(body[k] for k in fields))
+                    return [body]
+                if method == "DELETE":
+                    con.execute("DELETE FROM appliance_items WHERE family_id=? AND id=?", (FAMILY, item_id))
+                    return []
+        except sqlite3.Error:
+            st.error("데이터를 저장하지 못했습니다. 다시 시도해 주세요.")
+            return None
     params = {"family_id": f"eq.{FAMILY}"}
     if method == "GET":
         params.update({"select": "id,kind,name,price,purchased_on,replacement_on", "order": "replacement_on.asc"})
@@ -127,10 +201,30 @@ def state_for(replacement: date, today: date) -> str:
 st.title("🏠 우리집 가전")
 st.caption("구매는 간편하게, 교체는 잊지 않게 · 가족 공유")
 
-if not all([URL, KEY, FAMILY, PASSWORD]):
-    st.info("처음 한 번만 Supabase와 가족 암호를 연결해 주세요. 배포 방법은 app.py 맨 위에 있습니다.")
-    with st.expander("필요한 Secrets 이름"):
-        st.code("SUPABASE_URL\nSUPABASE_SERVICE_ROLE_KEY\nFAMILY_ID\nFAMILY_PASSWORD\nAPP_URL (QR용)")
+if not CLOUD or not PASSWORD:
+    try:
+        initialize_local()
+    except sqlite3.Error:
+        st.error("앱 저장소를 초기화하지 못했습니다. 앱을 재시작해 주세요.")
+        st.stop()
+
+if not PASSWORD and not saved_password():
+    st.info("처음 오셨네요! 가족이 함께 사용할 암호만 정하면 바로 시작합니다.")
+    st.caption("공개 주소를 가족에게 공유하기 전에 암호를 설정하세요.")
+    with st.form("first_password"):
+        new_password = st.text_input("가족 암호 (8자 이상)", type="password", max_chars=256)
+        confirmation = st.text_input("암호 확인", type="password", max_chars=256)
+        create = st.form_submit_button("암호 설정하고 시작", type="primary", use_container_width=True)
+    if create:
+        if len(new_password) < 8:
+            st.warning("암호는 8자 이상으로 정해 주세요.")
+        elif new_password != confirmation:
+            st.warning("두 암호가 일치하지 않습니다.")
+        elif create_password(new_password):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.warning("이미 암호가 설정되었습니다. 페이지를 새로고침해 로그인하세요.")
     st.stop()
 
 if not st.session_state.get("authenticated", False):
@@ -139,12 +233,15 @@ if not st.session_state.get("authenticated", False):
         entered = st.text_input("가족 암호", type="password", max_chars=256)
         login = st.form_submit_button("우리집 들어가기", use_container_width=True)
     if login:
-        if hmac.compare_digest(entered.encode(), PASSWORD.encode()):
+        if valid_password(entered):
             st.session_state.authenticated = True
             st.rerun()
         else:
             st.error("암호를 확인해 주세요.")
     st.stop()
+
+if not CLOUD:
+    st.caption("⚠️ 간편 저장 모드 · Cloud 재배포·서버 교체 시 데이터와 암호가 초기화될 수 있습니다.")
 
 add_tab, list_tab, qr_tab = st.tabs(["➕ 간편 등록", "📋 우리집 목록", "🔗 설정·QR"])
 
@@ -229,7 +326,7 @@ with list_tab:
 
 with qr_tab:
     st.caption("QR에는 앱 주소만 들어갑니다. 가족 암호는 별도로 전달하세요.")
-    app_url = config("APP_URL")
+    app_url = st.text_input("배포된 앱 주소", value=config("APP_URL"), placeholder="https://내앱.streamlit.app")
     parsed = urlparse(app_url)
     if app_url and parsed.scheme == "https" and parsed.netloc and not parsed.username and not parsed.password:
         image = qrcode.make(app_url)
@@ -239,9 +336,14 @@ with qr_tab:
         st.download_button("가족 공유 QR 다운로드", buffer.getvalue(), "family-appliances-qr.png", "image/png")
         st.link_button("앱 주소 열기", app_url)
     else:
-        st.info("배포 후 Secrets에 APP_URL을 https 주소로 입력하면 QR이 생성됩니다.")
+        st.info("위 칸에 현재 앱의 https 주소를 붙여넣으면 QR이 만들어집니다. Secrets 설정은 필요 없습니다.")
     st.caption("🔔 알림은 앱 내부 팝업입니다. 앱을 닫거나 화면이 잠기면 알림이 오지 않습니다.")
-    st.caption("최초 설정: app.py 상단의 SQL 실행 → Secrets 등록 → 앱 실행")
+    if not CLOUD:
+        st.caption("영구 보관이 필요할 때만 app.py 상단의 Supabase 설정을 추가하세요. 기존 데이터는 자동 이전되지 않습니다.")
+    rows_export = api("GET")
+    if rows_export:
+        st.download_button("제품 목록 CSV 백업", pd.DataFrame(rows_export).to_csv(index=False).encode("utf-8-sig"),
+                           "appliances-backup.csv", "text/csv")
     if st.button("로그아웃"):
         st.session_state.clear()
         st.rerun()
