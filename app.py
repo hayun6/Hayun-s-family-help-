@@ -86,7 +86,7 @@ h1 {font-size:1.65rem !important;} h3 {font-size:1.1rem !important;}
 </style>""", unsafe_allow_html=True)
 
 TODAY = datetime.now(ZoneInfo("Asia/Seoul")).date()
-KINDS = ["냉장고", "세탁기", "건조기", "에어컨", "TV", "청소기", "주방가전", "생활가전", "기타"]
+KINDS = ["생활가전", "주방가전", "냉난방가전", "영상·음향가전", "건강·미용가전", "기타"]
 
 
 def config(key: str) -> str:
